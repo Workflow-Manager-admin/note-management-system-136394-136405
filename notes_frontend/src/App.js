@@ -4,6 +4,7 @@ import "./notesapp.css";
 import { supabase } from "./supabaseClient";
 import NotesSidebar from "./components/NotesSidebar";
 import NoteEditor from "./components/NoteEditor";
+import Auth from "./components/Auth";
 
 // PUBLIC_INTERFACE
 /**
@@ -19,13 +20,32 @@ function App() {
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState(null);
+  // Auth/session state
+  const [session, setSession] = useState(null);
 
-  // Fetch all notes (or by search)
+  // Listen to Auth State
+  useEffect(() => {
+    // Initial load
+    supabase.auth.getSession().then(({ data: { session } }) => setSession(session));
+    // Listen for auth events
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+      setSelectedId(null); // Reset selection on login/logout
+      setActiveNote(null);
+      setNotes([]);
+      setSearch("");
+    });
+    return () => { listener?.subscription?.unsubscribe?.(); };
+  }, []);
+
+  // Fetch all notes belonging to the logged-in user (or by search)
   const fetchNotes = useCallback(async (searchTerm) => {
+    if (!session?.user) { setNotes([]); return; }
     setLoading(true);
     let query = supabase
       .from("notes")
       .select("id,title,content,updated_at")
+      .eq("user_id", session.user.id)
       .order("updated_at", { ascending: false });
     if (searchTerm && searchTerm.trim()) {
       query = query.ilike("title", `%${searchTerm}%`);
@@ -34,12 +54,12 @@ function App() {
     if (error) setError(error.message);
     else setNotes(data || []);
     setLoading(false);
-  }, []);
+  }, [session]);
 
   // Load the currently selected note (by id)
   const fetchNoteById = useCallback(
     async (id) => {
-      if (!id) {
+      if (!session?.user || !id) {
         setActiveNote(null);
         return;
       }
@@ -48,18 +68,20 @@ function App() {
         .from("notes")
         .select("*")
         .eq("id", id)
+        .eq("user_id", session.user.id)
         .single();
       if (error) setError(error.message);
       setActiveNote(data || null);
       setLoading(false);
     },
-    []
+    [session]
   );
 
-  // Initial fetch, and repeat whenever search changes.
+  // Initial fetch, and repeat whenever search or session changes.
   useEffect(() => {
-    fetchNotes(search);
-  }, [fetchNotes, search]);
+    if (session?.user) fetchNotes(search);
+    // else no fetch, handled by login
+  }, [fetchNotes, search, session]);
 
   // Reset selected note if it vanishes from the list (e.g. deleted)
   useEffect(() => {
@@ -82,11 +104,18 @@ function App() {
 
   // PUBLIC_INTERFACE
   const handleCreateNote = async () => {
+    if (!session?.user) return;
     setSaving(true);
     const now = new Date();
     const { data, error } = await supabase
       .from("notes")
-      .insert([{ title: "New Note", content: "", updated_at: now.toISOString() }])
+      .insert([{
+        title: "New Note",
+        content: "",
+        updated_at: now.toISOString(),
+        user_id: session.user.id,
+      }])
+      .select()
       .single();
     if (error) {
       setError("Could not create a new note: " + error.message);
@@ -101,7 +130,7 @@ function App() {
 
   // PUBLIC_INTERFACE
   const handleSaveNote = async (editedNote) => {
-    if (!editedNote.id) return;
+    if (!editedNote.id || !session?.user) return;
     setSaving(true);
     const { data, error } = await supabase
       .from("notes")
@@ -111,6 +140,7 @@ function App() {
         updated_at: new Date().toISOString(),
       })
       .eq("id", editedNote.id)
+      .eq("user_id", session.user.id)
       .select()
       .single();
 
@@ -128,9 +158,13 @@ function App() {
 
   // PUBLIC_INTERFACE
   const handleDeleteNote = async (id) => {
-    if (!id) return;
+    if (!id || !session?.user) return;
     setDeleting(true);
-    const { error } = await supabase.from("notes").delete().eq("id", id);
+    const { error } = await supabase
+      .from("notes")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", session.user.id);
     if (error) {
       setError("Could not delete the note: " + error.message);
       setDeleting(false);
@@ -153,59 +187,71 @@ function App() {
     document.documentElement.setAttribute("data-theme", "light");
   }, []);
 
+  // -- Main render --
+  if (session === undefined)
+    return null; // Still loading
+
   return (
     <div style={{ height: "100vh", background: "var(--bg-main)" }}>
-      <div className="notesapp-row">
-        <NotesSidebar
-          notes={notes}
-          selectedNoteId={selectedId}
-          onSelect={handleSelectNote}
-          onCreate={handleCreateNote}
-          searchTerm={search}
-          onSearch={handleSearch}
-          isLoading={loading}
-        />
-        <div style={{ flex: 1, minWidth: 0 }}>
-          {error && (
-            <div
-              style={{
-                background: "#ffeaea",
-                color: "#a94442",
-                padding: "14px 24px",
-                border: "1px solid #ffb3b3",
-                borderRadius: 6,
-                margin: "24px"
-              }}
-              role="alert"
-            >
-              {error}
-              <button
-                onClick={() => setError(null)}
-                style={{
-                  float: "right",
-                  background: "none",
-                  border: "none",
-                  color: "#c60000",
-                  fontWeight: 700,
-                  fontSize: "1.3em",
-                  cursor: "pointer"
-                }}
-                aria-label="Dismiss error"
-              >
-                ×
-              </button>
-            </div>
-          )}
-          <NoteEditor
-            note={activeNote}
-            onSave={handleSaveNote}
-            onDelete={handleDeleteNote}
-            isSaving={saving}
-            isDeleting={deleting}
-            keyProp={selectedId} // To reset editor state on note switch
+      {!session?.user && (
+        <Auth session={null} onAuthChange={setSession} />
+      )}
+      {session?.user && (
+        <div className="notesapp-row">
+          <div style={{ width: "100vw", padding: 0, background: "#e3f2fd" }}>
+            <Auth session={session} onAuthChange={setSession} />
+          </div>
+          <NotesSidebar
+            notes={notes}
+            selectedNoteId={selectedId}
+            onSelect={handleSelectNote}
+            onCreate={handleCreateNote}
+            searchTerm={search}
+            onSearch={handleSearch}
+            isLoading={loading}
           />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {error && (
+              <div
+                style={{
+                  background: "#ffeaea",
+                  color: "#a94442",
+                  padding: "14px 24px",
+                  border: "1px solid #ffb3b3",
+                  borderRadius: 6,
+                  margin: "24px"
+                }}
+                role="alert"
+              >
+                {error}
+                <button
+                  onClick={() => setError(null)}
+                  style={{
+                    float: "right",
+                    background: "none",
+                    border: "none",
+                    color: "#c60000",
+                    fontWeight: 700,
+                    fontSize: "1.3em",
+                    cursor: "pointer"
+                  }}
+                  aria-label="Dismiss error"
+                >
+                  ×
+                </button>
+              </div>
+            )}
+            <NoteEditor
+              note={activeNote}
+              onSave={handleSaveNote}
+              onDelete={handleDeleteNote}
+              isSaving={saving}
+              isDeleting={deleting}
+              keyProp={selectedId}
+            />
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
